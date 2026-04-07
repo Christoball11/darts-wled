@@ -1173,7 +1173,7 @@ def process_variant_x01(msg):
     elif msg['event'] == 'dart1-thrown' or msg['event'] == 'dart2-thrown' or msg['event'] == 'dart3-thrown':
         valDart = str(msg['game']['dartValue'])
         if valDart != '0':
-            process_dartscore_effect(valDart, playerIndex=msg.get('playerIndex'))
+            process_dartscore_effect(valDart, dart_game=msg.get('game', {}), playerIndex=msg.get('playerIndex'))
 
     elif msg['event'] == 'darts-pulled':
                 check_player_idle(msg.get('playerIndex'), 'Darts-pulled next: '+ str(msg.get('player', 'Unknown')))
@@ -1292,9 +1292,45 @@ def process_variant_ATC(msg):
     elif msg['event'] == 'game-started':
             check_player_idle(msg.get('playerIndex'), 'game-started')
 
-def process_dartscore_effect(singledartscore, playerIndex=None):
+def process_segment_effect(dart_game, singledartscore, playerIndex=None):
+    field_number = str(dart_game.get('fieldNumber', '')).strip()
+    field_multiplier_raw = dart_game.get('fieldMultiplier', None)
+
+    try:
+        field_multiplier = int(field_multiplier_raw)
+    except Exception:
+        field_multiplier = None
+
+    # Prefer explicit bull variants if available.
+    if field_number == '25':
+        if field_multiplier == 1 and DART_SCORE_BULL_SINGLE_EFFECTS is not None:
+            control_wled(DART_SCORE_BULL_SINGLE_EFFECTS, 'Darts-thrown: S-Bull (25)', playerIndex=playerIndex, argument_name='-DSBULL25')
+            return True
+        elif field_multiplier == 2 and DART_SCORE_BULL_DOUBLE_EFFECTS is not None:
+            control_wled(DART_SCORE_BULL_DOUBLE_EFFECTS, 'Darts-thrown: D-Bull (50)', playerIndex=playerIndex, argument_name='-DSBULL50')
+            return True
+
+    # Prefer explicit double/triple segment triggers before generic score triggers.
+    if field_number in SCORE_DARTDOUBLE_EFFECTS and field_multiplier == 2 and SCORE_DARTDOUBLE_EFFECTS[field_number] is not None:
+        control_wled(SCORE_DARTDOUBLE_EFFECTS[field_number], 'Darts-thrown: D' + field_number, playerIndex=playerIndex, argument_name=f'-DD{field_number}')
+        return True
+
+    if field_number in SCORE_DARTTRIPLE_EFFECTS and field_multiplier == 3 and SCORE_DARTTRIPLE_EFFECTS[field_number] is not None:
+        control_wled(SCORE_DARTTRIPLE_EFFECTS[field_number], 'Darts-thrown: T' + field_number, playerIndex=playerIndex, argument_name=f'-DT{field_number}')
+        return True
+
+    return False
+
+
+def process_dartscore_effect(singledartscore, dart_game=None, playerIndex=None):
+    if dart_game is None:
+        dart_game = {}
+
+    if process_segment_effect(dart_game, singledartscore, playerIndex=playerIndex):
+        return
+
     if (singledartscore == '25' or singledartscore == '50') and DART_SCORE_BULL_EFFECTS is not None:
-        control_wled(DART_SCORE_BULL_EFFECTS, 'Darts-thrown: ' + singledartscore, playerIndex=playerIndex, argument_name='-DSBULL')    
+        control_wled(DART_SCORE_BULL_EFFECTS, 'Darts-thrown: ' + singledartscore, playerIndex=playerIndex, argument_name='-DSBULL')
     elif singledartscore in SCORE_DARTSCORE_EFFECTS and SCORE_DARTSCORE_EFFECTS[singledartscore] is not None:
         control_wled(SCORE_DARTSCORE_EFFECTS[singledartscore], 'Darts-thrown: ' + singledartscore, playerIndex=playerIndex, argument_name=f'-DS{singledartscore}')
 
@@ -1569,7 +1605,11 @@ if __name__ == "__main__":
     for ds in range(1, 21):
         dartscore = str(ds)
         ap.add_argument("-DS" + dartscore, "--dart_score_" + dartscore + "_effects", default=None, required=False, nargs='*', help="WLED effect-definition score of single dart")
+        ap.add_argument("-DD" + dartscore, "--dart_double_" + dartscore + "_effects", default=None, required=False, nargs='*', help="WLED effect-definition for double field of single dart")
+        ap.add_argument("-DT" + dartscore, "--dart_triple_" + dartscore + "_effects", default=None, required=False, nargs='*', help="WLED effect-definition for triple field of single dart")
     ap.add_argument("-DSBULL", "--dart_score_BULL_effects", default=None, required=False, nargs='*', help="WLED effect-definition score of single dart")
+    ap.add_argument("-DSBULL25", "--dart_score_BULL_SINGLE_effects", default=None, required=False, nargs='*', help="WLED effect-definition for single bull (25)")
+    ap.add_argument("-DSBULL50", "--dart_score_BULL_DOUBLE_effects", default=None, required=False, nargs='*', help="WLED effect-definition for double bull (50)")
     # NEEDS TO BE MIGRATED
     ap.add_argument("-SOFF", "--wled_off_at_start", type=int, choices=range(0, 2), default=False, required=False, help="Turns WLED off when extension is started")
     args = vars(ap.parse_args())
@@ -1606,6 +1646,10 @@ if __name__ == "__main__":
     for sds in range(1, 21):
         sdartscore = str(sds)
         WLED_SETTINGS_ARGS["dart_score_" + sdartscore + "_effects"] = args["dart_score_" + sdartscore + "_effects"]
+        WLED_SETTINGS_ARGS["dart_double_" + sdartscore + "_effects"] = args["dart_double_" + sdartscore + "_effects"]
+        WLED_SETTINGS_ARGS["dart_triple_" + sdartscore + "_effects"] = args["dart_triple_" + sdartscore + "_effects"]
+    WLED_SETTINGS_ARGS['dart_score_BULL_SINGLE_effects'] = args['dart_score_BULL_SINGLE_effects']
+    WLED_SETTINGS_ARGS['dart_score_BULL_DOUBLE_effects'] = args['dart_score_BULL_DOUBLE_effects']
     for sA in range(1, 13):
         sarea = str(sA)
         WLED_SETTINGS_ARGS["score_area_" + sarea + "_effects"] = args["score_area_" + sarea + "_effects"]
@@ -1774,11 +1818,19 @@ if __name__ == "__main__":
         SCORE_AREA_EFFECTS[a] = parsed_score_area
         # ppi(parsed_score_area)
     SCORE_DARTSCORE_EFFECTS = dict()
+    SCORE_DARTDOUBLE_EFFECTS = dict()
+    SCORE_DARTTRIPLE_EFFECTS = dict()
     for ds in range(1, 21):
         parsed_dartscore = parse_effects_argument(args["dart_score_" + str(ds) + "_effects"])
         SCORE_DARTSCORE_EFFECTS[str(ds)] = parsed_dartscore
+        parsed_double = parse_effects_argument(args["dart_double_" + str(ds) + "_effects"])
+        SCORE_DARTDOUBLE_EFFECTS[str(ds)] = parsed_double
+        parsed_triple = parse_effects_argument(args["dart_triple_" + str(ds) + "_effects"])
+        SCORE_DARTTRIPLE_EFFECTS[str(ds)] = parsed_triple
         # ppi(parsed_score_area)
     DART_SCORE_BULL_EFFECTS = parse_effects_argument(args['dart_score_BULL_effects'])
+    DART_SCORE_BULL_SINGLE_EFFECTS = parse_effects_argument(args['dart_score_BULL_SINGLE_effects'])
+    DART_SCORE_BULL_DOUBLE_EFFECTS = parse_effects_argument(args['dart_score_BULL_DOUBLE_effects'])
     
     # Hauptschleife mit automatischem Neustart
     while True:
