@@ -1246,7 +1246,7 @@ def process_variant_Bermuda(msg):
     elif msg['event'] == 'match-started':
             check_player_idle(msg.get('playerIndex'), 'match-started')
 
-        elif msg['event'] == 'game-started':
+    elif msg['event'] == 'game-started':
             process_game_started(msg.get('playerIndex'))
 
 def process_variant_Cricket(msg):
@@ -1281,7 +1281,7 @@ def process_variant_Cricket(msg):
     elif msg['event'] == 'match-started':
             check_player_idle(msg.get('playerIndex'), 'match-started')
 
-        elif msg['event'] == 'game-started':
+    elif msg['event'] == 'game-started':
             process_game_started(msg.get('playerIndex'))
 
 def process_variant_ATC(msg):
@@ -1297,7 +1297,7 @@ def process_variant_ATC(msg):
     elif msg['event'] == 'match-started':
             check_player_idle(msg.get('playerIndex'), 'match-started')
 
-        elif msg['event'] == 'game-started':
+    elif msg['event'] == 'game-started':
             process_game_started(msg.get('playerIndex'))
 
 def process_segment_effect(dart_game, singledartscore, playerIndex=None):
