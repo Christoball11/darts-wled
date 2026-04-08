@@ -6,6 +6,8 @@ import argparse
 import threading
 import logging
 import sys
+import atexit
+from concurrent.futures import ThreadPoolExecutor
 from color_constants import colors as WLED_COLORS
 from wled_data_manager import WLEDDataManager
 from connection_diagnostics import ConnectionDiagnostics
@@ -31,6 +33,22 @@ http_session = requests.Session()
 http_session.verify = False
 # Deaktiviere automatisches Reconnect - wir steuern das manuell
 sio = socketio.Client(http_session=http_session, logger=False, engineio_logger=True, reconnection=False)
+
+# Resource management: ThreadPoolExecutor for WLED message handling (CRITICAL FIX: prevents thread explosion)
+_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix='wled-msg-')
+
+def _cleanup_resources():
+    """Cleanup handler to shutdown executor and close session gracefully"""
+    try:
+        _executor.shutdown(wait=True, timeout=5)
+    except Exception as e:
+        logger.warning(f"Error shutting down executor: {e}")
+    try:
+        http_session.close()
+    except Exception as e:
+        logger.warning(f"Error closing http_session: {e}")
+
+atexit.register(_cleanup_resources)
 
 
 VERSION = '1.10.4'
@@ -535,7 +553,9 @@ def on_message_wled(ws, message):
         except Exception as e:
             ppe(f'WS-Message processing failed for {ws.url}: ', e)
 
-    threading.Thread(target=process).start()
+    # CRITICAL FIX: Use ThreadPoolExecutor instead of creating unbounded threads
+    # This prevents thread explosion (was creating 1 thread/second, now capped at 5 concurrent)
+    _executor.submit(process)
 
 def on_close_wled(ws, close_status_code, close_msg):
     try:
@@ -764,13 +784,16 @@ def get_segment_count():
         clean_host = WLED_ENDPOINT_PRIMARY.replace('ws://', '').replace('wss://', '').replace('http://', '').replace('https://', '').rstrip('/ws').rstrip('/')
         state_url = f'http://{clean_host}/json/state'
         response = requests.get(state_url, timeout=2)
-        if response.status_code == 200:
-            state_data = response.json()
-            if 'seg' in state_data and isinstance(state_data['seg'], list):
-                segment_count = len(state_data['seg'])
-                if DEBUG:
-                    ppi(f"  [DEBUG] Current segment count from controller: {segment_count}", None, '')
-                return segment_count
+        try:
+            if response.status_code == 200:
+                state_data = response.json()
+                if 'seg' in state_data and isinstance(state_data['seg'], list):
+                    segment_count = len(state_data['seg'])
+                    if DEBUG:
+                        ppi(f"  [DEBUG] Current segment count from controller: {segment_count}", None, '')
+                    return segment_count
+        finally:
+            response.close()  # FIX: Always close response to prevent FD leak
     except Exception as e:
         if DEBUG:
             ppe("Error while determining segment count: ", e)
@@ -815,14 +838,17 @@ def get_led_count(endpoint_url=None):
         # Fallback: Direkte HTTP-Abfrage vom Controller
         info_url = f'http://{clean_host}/json/info'
         response = requests.get(info_url, timeout=2)
-        if response.status_code == 200:
-            info_data = response.json()
-            if 'leds' in info_data and 'count' in info_data['leds']:
-                count = info_data['leds']['count']
-                led_counts[cache_key] = count  # Cache speichern
-                if DEBUG:
-                    ppi(f"  [DEBUG] LED count from HTTP request for {clean_host}: {count}", None, '')
-                return count
+        try:
+            if response.status_code == 200:
+                info_data = response.json()
+                if 'leds' in info_data and 'count' in info_data['leds']:
+                    count = info_data['leds']['count']
+                    led_counts[cache_key] = count  # Cache speichern
+                    if DEBUG:
+                        ppi(f"  [DEBUG] LED count from HTTP request for {clean_host}: {count}", None, '')
+                    return count
+        finally:
+            response.close()  # FIX: Always close response to prevent FD leak
     except Exception as e:
         if DEBUG:
             ppe(f"Error while determining LED count for {endpoint_url or WLED_ENDPOINT_PRIMARY}: ", e)
@@ -982,17 +1008,18 @@ def broadcast(data):
             ppe(f"  [ERROR] Failed to start thread for {wled_ep.url}: ", e)
             continue
     
-    # Optional: Warte auf alle Threads (für besseres Logging)
-    if DEBUG:
-        for thread in results:
-            thread.join(timeout=1)
+    # FIX: Always wait for threads to complete, not just in DEBUG mode
+    # This prevents orphaned threads from accumulating
+    for thread in results:
+        thread.join(timeout=2)  # Use reasonable timeout to avoid blocking indefinitely
 
 def broadcast_intern(endpoint, data):
     """
     Sendet Daten an einen WLED-Endpoint und loggt das Ergebnis
     """
     try:
-        endpoint.send(json.dumps(data))
+        # FIX: Add timeout to prevent blocking indefinitely if WLED is unresponsive
+        endpoint.send(json.dumps(data), opcode=websocket.ABNF.OPCODE_TEXT, timeout=1.0)
         if DEBUG:
             ppi(f"  [OK] Sent to {endpoint.url}: {json.dumps(data)}", None, '')
         return True
