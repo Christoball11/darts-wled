@@ -1149,6 +1149,14 @@ def process_lobby(msg):
     elif msg['action'] == 'player-left' and PLAYER_LEFT_EFFECTS is not None:
         control_wled(PLAYER_LEFT_EFFECTS, 'Player left!', argument_name='-PL')
 
+
+def process_game_started(playerIndex):
+    if GAME_START_EFFECTS is not None:
+        # Use normal effect flow so a configured duration (e.g. "|1") returns to idle automatically.
+        control_wled(GAME_START_EFFECTS, 'game-started', bss_requested=True, playerIndex=playerIndex, argument_name='-GS')
+    else:
+        check_player_idle(playerIndex, 'game-started')
+
 def process_variant_x01(msg):
     if msg['event'] == 'darts-thrown':
         val = str(msg['game']['dartValue'])
@@ -1196,7 +1204,7 @@ def process_variant_x01(msg):
                 check_player_idle(msg.get('playerIndex'), 'match-started')
 
     elif msg['event'] == 'game-started':
-                check_player_idle(msg.get('playerIndex'), 'game-started')
+                process_game_started(msg.get('playerIndex'))
 
 def process_variant_Bermuda(msg):
     if msg['event'] == 'darts-thrown':
@@ -1238,8 +1246,8 @@ def process_variant_Bermuda(msg):
     elif msg['event'] == 'match-started':
             check_player_idle(msg.get('playerIndex'), 'match-started')
 
-    elif msg['event'] == 'game-started':
-            check_player_idle(msg.get('playerIndex'), 'game-started')
+        elif msg['event'] == 'game-started':
+            process_game_started(msg.get('playerIndex'))
 
 def process_variant_Cricket(msg):
     if msg['event'] == 'darts-thrown':
@@ -1273,8 +1281,8 @@ def process_variant_Cricket(msg):
     elif msg['event'] == 'match-started':
             check_player_idle(msg.get('playerIndex'), 'match-started')
 
-    elif msg['event'] == 'game-started':
-            check_player_idle(msg.get('playerIndex'), 'game-started')
+        elif msg['event'] == 'game-started':
+            process_game_started(msg.get('playerIndex'))
 
 def process_variant_ATC(msg):
     if msg['event'] == 'darts-pulled':
@@ -1289,8 +1297,8 @@ def process_variant_ATC(msg):
     elif msg['event'] == 'match-started':
             check_player_idle(msg.get('playerIndex'), 'match-started')
 
-    elif msg['event'] == 'game-started':
-            check_player_idle(msg.get('playerIndex'), 'game-started')
+        elif msg['event'] == 'game-started':
+            process_game_started(msg.get('playerIndex'))
 
 def process_segment_effect(dart_game, singledartscore, playerIndex=None):
     field_number = str(dart_game.get('fieldNumber', '')).strip()
@@ -1586,6 +1594,7 @@ if __name__ == "__main__":
     ap.add_argument("-IDE6", "--idle_effect_player6", default=None, required=False, nargs='*', help="WLED effect-definition when waiting for throw of Player6")
     ap.add_argument("-G", "--game_won_effects", default=None, required=False, nargs='*', help="WLED effect-definition when game won occurs")
     ap.add_argument("-M", "--match_won_effects", default=None, required=False, nargs='*', help="WLED effect-definition when match won occurs")
+    ap.add_argument("-GS", "--game_start_effects", default=None, required=False, nargs='*', help="WLED effect-definition when game started occurs")
     ap.add_argument("-B", "--busted_effects", default=None, required=False, nargs='*', help="WLED effect-definition when bust occurs")
     ap.add_argument("-PJ", "--player_joined_effects", default=None, required=False, nargs='*', help="WLED effect-definition when player-join occurs")
     ap.add_argument("-PL", "--player_left_effects", default=None, required=False, nargs='*', help="WLED effect-definition when player-left occurs")
@@ -1636,6 +1645,7 @@ if __name__ == "__main__":
         'idle_effect_player6': args['idle_effect_player6'],
         'game_won_effects': args['game_won_effects'],
         'match_won_effects': args['match_won_effects'],
+        'game_start_effects': args['game_start_effects'],
         'busted_effects': args['busted_effects'],
         'player_joined_effects': args['player_joined_effects'],
         'player_left_effects': args['player_left_effects']
@@ -1801,6 +1811,7 @@ if __name__ == "__main__":
     IDLE_EFFECT6 = parse_effects_argument(args['idle_effect_player6'])
     GAME_WON_EFFECTS = parse_effects_argument(args['game_won_effects'])
     MATCH_WON_EFFECTS = parse_effects_argument(args['match_won_effects'])
+    GAME_START_EFFECTS = parse_effects_argument(args['game_start_effects'])
     BUSTED_EFFECTS = parse_effects_argument(args['busted_effects'])
     HIGH_FINISH_EFFECTS = parse_effects_argument(args['high_finish_effects'])
     PLAYER_JOINED_EFFECTS = parse_effects_argument(args['player_joined_effects'])
