@@ -86,6 +86,8 @@ connection_status = {
 # Reconnect tracking per endpoint
 reconnect_attempts = {}  # {endpoint_url: {'attempts': 0, 'last_attempt': timestamp, 'backoff': seconds, 'reconnecting': False}}
 reconnect_lock = threading.Lock()  # Lock für Thread-sichere Reconnect-Prüfung
+_data_feeder_reconnect_lock = threading.Lock()
+_data_feeder_reconnect_pending = False
 MAX_RECONNECT_ATTEMPTS = 10
 INITIAL_BACKOFF = 3  # Sekunden
 MAX_BACKOFF = 60  # Maximal 60 Sekunden warten
@@ -229,34 +231,50 @@ def restart_application():
 
 def check_data_feeder_connection():
     """
-    Prüft ob Data-Feeder erreichbar ist (ohne zu verbinden)
+    Prüft ob Data-Feeder erreichbar ist (ohne dauerhafte WS-Verbindung).
+    Mit Caller v3 reicht ein HTTP-Healthcheck; unauthentifizierte WS-Probes
+    werden vom Caller abgelehnt.
     """
+    if sio.connected:
+        return True
     try:
-        server_host = CON.replace('ws://', '').replace('wss://', '').replace('http://', '').replace('https://', '')
-        
-        # Teste ws:// - mit kürzerem Timeout und reconnection=False
-        try:
-            test_url = 'ws://' + server_host
-            test_sio = socketio.Client(http_session=http_session, logger=False, engineio_logger=False, reconnection=False)
-            test_sio.connect(test_url, transports=['websocket'], wait_timeout=2)
-            test_sio.disconnect()
-            return True
-        except:
-            pass
-        
-        # Teste wss://
-        try:
-            test_url = 'wss://' + server_host
-            test_sio = socketio.Client(http_session=http_session, logger=False, engineio_logger=False, reconnection=False)
-            test_sio.connect(test_url, transports=['websocket'], wait_timeout=2)
-            test_sio.disconnect()
-            return True
-        except:
-            pass
-    except:
+        if caller_auth_client is not None:
+            resp = caller_auth_client.session.get(
+                f"{caller_auth_client.caller_url}/api/ext/info",
+                timeout=3,
+            )
+            return resp.status_code == 200
+    except Exception:
         pass
-    
     return False
+
+
+def schedule_data_feeder_reconnect():
+    """Reconnect zum Data-Feeder mit JWT (nach Disconnect)."""
+    global _data_feeder_reconnect_pending
+    with _data_feeder_reconnect_lock:
+        if _data_feeder_reconnect_pending:
+            return
+        _data_feeder_reconnect_pending = True
+
+    def worker():
+        global _data_feeder_reconnect_pending
+        try:
+            time.sleep(2)
+            if connection_status['restart_requested']:
+                return
+            if sio.connected:
+                connection_status['data_feeder'] = True
+                return
+            ppi('[INFO] Reconnecting to Data-Feeder...', None, '')
+            if connect_data_feeder_with_retry():
+                connection_status['data_feeder'] = True
+                ppi('[OK] Data-Feeder reconnected', None, '')
+        finally:
+            with _data_feeder_reconnect_lock:
+                _data_feeder_reconnect_pending = False
+
+    threading.Thread(target=worker, name='data-feeder-reconnect', daemon=True).start()
 
 def check_wled_connection():
     """
@@ -1852,7 +1870,8 @@ def message(msg):
 def disconnect():
     connection_status['data_feeder'] = False
     ppi('DISCONNECTED FROM DATA-FEEDER', None, '')
-    ppi('Monitoring-Thread will check for reconnection...', None, '')
+    ppi('Scheduling authenticated reconnect...', None, '')
+    schedule_data_feeder_reconnect()
     
     # Diagnose nur wenn DEBUG=1 UND CONNECTION_TEST=1
     if DEBUG and CONNECTION_TEST == 1:
@@ -1879,6 +1898,7 @@ def _connect_error_is_auth_failure(data) -> bool:
     return (
         'invalid auth' in lowered
         or 'invalid_auth' in lowered
+        or 'missing auth' in lowered
         or 'unauthorized' in lowered
         or 'authentication' in lowered
     )
