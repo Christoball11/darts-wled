@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 import json
 import platform
 import random
@@ -16,6 +16,13 @@ from wled_endpoint_router import WLEDEndpointRouter, normalize_wled_ws_url
 from combo_effects import ComboEffectTracker, parse_combo_effects_argument
 from player_idle_effects import PlayerIdleEffects, parse_player_idle_effects_argument
 from dart_multiplier_effects import DartMultiplierEffects, parse_dart_multiplier_effects_argument
+from caller_auth import (
+    CallerAuthClient,
+    CallerAuthError,
+    caller_url_from_connection,
+    default_credentials_dir,
+    load_manifest,
+)
 import time
 import requests
 import socketio
@@ -63,6 +70,7 @@ WLED_SETTINGS_ARGS={}
 
 # Global WLED Data Manager variable
 wled_data_manager = None
+caller_auth_client = None
 
 # Global flags for connection status
 connection_status = {
@@ -1408,7 +1416,7 @@ def process_variant_x01(msg):
         process_dart_multiplier_effect(msg)
         valDart = str(msg['game']['dartValue'])
         if valDart != '0':
-            process_dartscore_effect(valDart, playerIndex=msg.get('playerIndex'))
+            process_dartscore_effect(valDart, dart_game=msg.get('game', {}), playerIndex=msg.get('playerIndex'))
 
     elif msg['event'] == 'darts-pulled':
                 combo_tracker.clear(msg.get('playerIndex'))
@@ -1562,9 +1570,43 @@ def process_variant_ATC(msg):
     elif msg['event'] == 'game-started':
             check_player_idle(msg.get('playerIndex'), 'game-started', player_name=msg.get('player'))
 
-def process_dartscore_effect(singledartscore, playerIndex=None):
+def process_segment_effect(dart_game, singledartscore, playerIndex=None):
+    field_number = str(dart_game.get('fieldNumber', '')).strip()
+    field_multiplier_raw = dart_game.get('fieldMultiplier', None)
+
+    try:
+        field_multiplier = int(field_multiplier_raw)
+    except Exception:
+        field_multiplier = None
+
+    if field_number == '25':
+        if field_multiplier == 1 and DART_SCORE_BULL_SINGLE_EFFECTS is not None:
+            control_wled(DART_SCORE_BULL_SINGLE_EFFECTS, 'Darts-thrown: S-Bull (25)', playerIndex=playerIndex, argument_name='-DSBULL25')
+            return True
+        elif field_multiplier == 2 and DART_SCORE_BULL_DOUBLE_EFFECTS is not None:
+            control_wled(DART_SCORE_BULL_DOUBLE_EFFECTS, 'Darts-thrown: D-Bull (50)', playerIndex=playerIndex, argument_name='-DSBULL50')
+            return True
+
+    if field_number in SCORE_DARTDOUBLE_EFFECTS and field_multiplier == 2 and SCORE_DARTDOUBLE_EFFECTS[field_number] is not None:
+        control_wled(SCORE_DARTDOUBLE_EFFECTS[field_number], 'Darts-thrown: D' + field_number, playerIndex=playerIndex, argument_name=f'-DD{field_number}')
+        return True
+
+    if field_number in SCORE_DARTTRIPLE_EFFECTS and field_multiplier == 3 and SCORE_DARTTRIPLE_EFFECTS[field_number] is not None:
+        control_wled(SCORE_DARTTRIPLE_EFFECTS[field_number], 'Darts-thrown: T' + field_number, playerIndex=playerIndex, argument_name=f'-DT{field_number}')
+        return True
+
+    return False
+
+
+def process_dartscore_effect(singledartscore, dart_game=None, playerIndex=None):
+    if dart_game is None:
+        dart_game = {}
+
+    if process_segment_effect(dart_game, singledartscore, playerIndex=playerIndex):
+        return
+
     if (singledartscore == '25' or singledartscore == '50') and DART_SCORE_BULL_EFFECTS is not None:
-        control_wled(DART_SCORE_BULL_EFFECTS, 'Darts-thrown: ' + singledartscore, playerIndex=playerIndex, argument_name='-DSBULL')    
+        control_wled(DART_SCORE_BULL_EFFECTS, 'Darts-thrown: ' + singledartscore, playerIndex=playerIndex, argument_name='-DSBULL')
     elif singledartscore in SCORE_DARTSCORE_EFFECTS and SCORE_DARTSCORE_EFFECTS[singledartscore] is not None:
         control_wled(SCORE_DARTSCORE_EFFECTS[singledartscore], 'Darts-thrown: ' + singledartscore, playerIndex=playerIndex, argument_name=f'-DS{singledartscore}')
 
@@ -1735,6 +1777,10 @@ def connect():
 @sio.event
 def connect_error(data):
     ppe("CONNECTION TO DATA-FEEDER FAILED! " + sio.connection_url, data)
+
+    if caller_auth_client is not None and _connect_error_is_auth_failure(data):
+        ppi('[AUTH] Connection rejected, clearing cached credentials...', None, '')
+        caller_auth_client.force_reauth()
     
     # Diagnose nur wenn DEBUG=1 UND CONNECTION_TEST=1
     if DEBUG and CONNECTION_TEST == 1:
@@ -1821,6 +1867,46 @@ def disconnect():
         ConnectionDiagnostics.diagnose_connection(host, port, 'Data-Feeder')
 
 
+def _connect_error_is_auth_failure(data) -> bool:
+    if data is None:
+        return False
+    if isinstance(data, (dict, list)):
+        text = json.dumps(data)
+    else:
+        text = str(data)
+    lowered = text.lower()
+    return (
+        'invalid auth' in lowered
+        or 'invalid_auth' in lowered
+        or 'unauthorized' in lowered
+        or 'authentication' in lowered
+    )
+
+
+def _socketio_connect_kwargs():
+    kwargs = {'transports': ['websocket'], 'wait_timeout': 3}
+    if caller_auth_client is not None:
+        jwt = caller_auth_client.acquire_token()
+        kwargs['auth'] = {'token': jwt}
+    return kwargs
+
+
+def init_caller_auth() -> None:
+    global caller_auth_client
+    manifest_path = os.environ.get('MANIFEST_PATH', '').strip() or None
+    manifest = load_manifest(manifest_path)
+    creds_dir = os.environ.get('CALLER_CREDENTIALS_DIR', '').strip()
+    credentials_dir = Path(creds_dir) if creds_dir else default_credentials_dir(manifest.ext_id)
+    caller_auth_client = CallerAuthClient(
+        manifest,
+        credentials_dir,
+        caller_url_from_connection(CON),
+    )
+    caller_auth_client.acquire_token()
+    caller_auth_client.start_refresh_loop()
+    ppi(f'[AUTH] Caller extension ready ({manifest.ext_id} v{manifest.version})', None, '')
+
+
 def connect_data_feeder_with_retry():
     """
     Versucht Data-Feeder-Verbindung herzustellen
@@ -1833,7 +1919,7 @@ def connect_data_feeder_with_retry():
         try:
             server_url = 'ws://' + server_host
             ppi(f'Verbinde zu {server_url}...', None, '')
-            sio.connect(server_url, transports=['websocket'], wait_timeout=3)
+            sio.connect(server_url, **_socketio_connect_kwargs())
             # Status wird in @sio.event connect() gesetzt
             return True
         except Exception as e:
@@ -1844,7 +1930,7 @@ def connect_data_feeder_with_retry():
         try:
             server_url = 'wss://' + server_host
             ppi(f'Connecting to {server_url} (encrypted)...', None, '')
-            sio.connect(server_url, transports=['websocket'], wait_timeout=3)
+            sio.connect(server_url, **_socketio_connect_kwargs())
             # Status wird in @sio.event connect() gesetzt
             return True
         except Exception as e:
@@ -1964,7 +2050,11 @@ if __name__ == "__main__":
     for ds in range(1, 21):
         dartscore = str(ds)
         ap.add_argument("-DS" + dartscore, "--dart_score_" + dartscore + "_effects", default=None, required=False, nargs='*', help="WLED effect-definition score of single dart")
+        ap.add_argument("-DD" + dartscore, "--dart_double_" + dartscore + "_effects", default=None, required=False, nargs='*', help="WLED effect-definition for double field of single dart")
+        ap.add_argument("-DT" + dartscore, "--dart_triple_" + dartscore + "_effects", default=None, required=False, nargs='*', help="WLED effect-definition for triple field of single dart")
     ap.add_argument("-DSBULL", "--dart_score_BULL_effects", default=None, required=False, nargs='*', help="WLED effect-definition score of single dart")
+    ap.add_argument("-DSBULL25", "--dart_score_BULL_SINGLE_effects", default=None, required=False, nargs='*', help="WLED effect-definition for single bull (25)")
+    ap.add_argument("-DSBULL50", "--dart_score_BULL_DOUBLE_effects", default=None, required=False, nargs='*', help="WLED effect-definition for double bull (50)")
     ap.add_argument("-SLE", "--sleep_effect", default=None, required=False, nargs='*', help="WLED effect-definition when no activity is detected for sleep timeout duration")
     ap.add_argument("-SLET", "--sleep_timeout", type=int, default=300, required=False, help="Seconds of inactivity before sleep effect is triggered (default: 300 = 5min)")
     ap.add_argument("-SLEOFF", "--sleep_off_timeout", type=int, default=0, required=False, help="Minutes in sleep mode before WLED is turned off (default: 0 = never)")
@@ -2012,6 +2102,10 @@ if __name__ == "__main__":
     for sds in range(1, 21):
         sdartscore = str(sds)
         WLED_SETTINGS_ARGS["dart_score_" + sdartscore + "_effects"] = args["dart_score_" + sdartscore + "_effects"]
+        WLED_SETTINGS_ARGS["dart_double_" + sdartscore + "_effects"] = args["dart_double_" + sdartscore + "_effects"]
+        WLED_SETTINGS_ARGS["dart_triple_" + sdartscore + "_effects"] = args["dart_triple_" + sdartscore + "_effects"]
+    WLED_SETTINGS_ARGS['dart_score_BULL_SINGLE_effects'] = args['dart_score_BULL_SINGLE_effects']
+    WLED_SETTINGS_ARGS['dart_score_BULL_DOUBLE_effects'] = args['dart_score_BULL_DOUBLE_effects']
     for sA in range(1, 13):
         sarea = str(sA)
         WLED_SETTINGS_ARGS["score_area_" + sarea + "_effects"] = args["score_area_" + sarea + "_effects"]
@@ -2203,11 +2297,19 @@ if __name__ == "__main__":
         SCORE_AREA_EFFECTS[a] = parsed_score_area
         # ppi(parsed_score_area)
     SCORE_DARTSCORE_EFFECTS = dict()
+    SCORE_DARTDOUBLE_EFFECTS = dict()
+    SCORE_DARTTRIPLE_EFFECTS = dict()
     for ds in range(1, 21):
         parsed_dartscore = parse_effects_argument(args["dart_score_" + str(ds) + "_effects"])
         SCORE_DARTSCORE_EFFECTS[str(ds)] = parsed_dartscore
+        parsed_double = parse_effects_argument(args["dart_double_" + str(ds) + "_effects"])
+        SCORE_DARTDOUBLE_EFFECTS[str(ds)] = parsed_double
+        parsed_triple = parse_effects_argument(args["dart_triple_" + str(ds) + "_effects"])
+        SCORE_DARTTRIPLE_EFFECTS[str(ds)] = parsed_triple
         # ppi(parsed_score_area)
     DART_SCORE_BULL_EFFECTS = parse_effects_argument(args['dart_score_BULL_effects'])
+    DART_SCORE_BULL_SINGLE_EFFECTS = parse_effects_argument(args['dart_score_BULL_SINGLE_effects'])
+    DART_SCORE_BULL_DOUBLE_EFFECTS = parse_effects_argument(args['dart_score_BULL_DOUBLE_effects'])
     
     # Combo Effects
     COMBO_EFFECTS = parse_combo_effects_argument(args['combo_effects'], parse_effects_argument)
@@ -2220,6 +2322,12 @@ if __name__ == "__main__":
     # Dart Multiplier Effects (single dart, triggered on dart1/2/3-thrown)
     DART_MULTIPLIER_DEFS = parse_dart_multiplier_effects_argument(args['dart_multiplier_effects'], parse_effects_argument)
     dart_multiplier_effects = DartMultiplierEffects(DART_MULTIPLIER_DEFS, debug=DEBUG)
+
+    try:
+        init_caller_auth()
+    except CallerAuthError as exc:
+        ppe('[AUTH] Initialization failed:', exc)
+        sys.exit(1)
     
     # Hauptschleife mit automatischem Neustart
     while True:
